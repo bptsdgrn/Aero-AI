@@ -41,6 +41,19 @@ OLLAMA_MODEL = "llama3:latest"
 MODEL_PATH = r"C:\Users\boopa\Desktop\DS\Drone\random_forest_model.pkl"
 COLUMNS_PATH = r"C:\Users\boopa\Desktop\DS\Drone\model_columns.pkl"
 
+# ✅ Your trained YOLO model path
+YOLO_MODEL_PATH = "runs/detect/train/weights/best.pt"
+
+# ✅ Confidence threshold to avoid false detections
+CONFIDENCE_THRESHOLD = 0.5
+
+# ✅ Keywords that indicate user is asking about detection data
+DATA_KEYWORDS = [
+    "detect", "drone", "last", "recent", "found", "confidence",
+    "when", "how many", "show", "list", "latest", "history",
+    "today", "yesterday", "database", "stored", "record"
+]
+
 # -----------------------------
 # AWS CLIENTS
 # -----------------------------
@@ -99,23 +112,35 @@ def ollama_call(prompt, timeout=60):
 
 
 def data_query_agent(user_query):
+    # ✅ FIX: Strict SQL prompt — prevents hallucination, forces real DB query only
     sql_prompt = f"""
-You are a SQL expert. The database has a table called `detections` with these columns:
+You are a SQL expert connected to a real MySQL database.
+The database has a table called `detections` with these exact columns:
 - id (int)
 - drone_type (varchar)
 - confidence (float)
 - image_url (varchar)
 - detected_at (datetime)
 
-Convert the following user question into a valid MySQL SELECT query only.
-Do not include any explanation. Return only the SQL query, nothing else.
+STRICT RULES:
+- Return ONLY a valid MySQL SELECT query. Nothing else.
+- Do NOT fabricate, assume, or invent any data.
+- Do NOT include any explanation, markdown, or backticks.
+- Do NOT use columns that do not exist in the table above.
+- If the question cannot be answered using this table, return exactly: SELECT 'NO_DATA' AS message;
+- Always query from the `detections` table only.
 
 User question: {user_query}
 """
     try:
         sql_query = ollama_call(sql_prompt)
+
+        # Strip any accidental markdown backticks
+        sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+
         if not sql_query.upper().startswith("SELECT"):
-            return None, "Generated query was not a SELECT statement. Aborting for safety."
+            return None, None, "Generated query was not a SELECT statement. Aborting for safety."
+
         connection = get_db_connection()
         cursor = connection.cursor()
         cursor.execute(sql_query)
@@ -229,6 +254,7 @@ Rules:
 - Set "email" to the email address found in the message, or null if none
 - Set "report_title" to a suitable title if the user mentions a specific scope, or null for default
 - Do not include any explanation outside the JSON
+- If the user asks about detections, drones detected, last drone, recent records — always use "data_query"
 
 User message: {user_query}
 """
@@ -258,10 +284,20 @@ def llama_general_response(user_query):
 
 
 # =============================================
-# YOLO MODEL
+# ✅ LOAD YOUR TRAINED YOLO MODEL
 # =============================================
 
-model = YOLO("yolov8n.pt")
+@st.cache_resource
+def load_yolo_model():
+    if not os.path.exists(YOLO_MODEL_PATH):
+        st.error(
+            f"❌ Trained model not found at: `{YOLO_MODEL_PATH}`\n\n"
+            "Make sure you have trained the model and the file exists."
+        )
+        st.stop()
+    return YOLO(YOLO_MODEL_PATH)
+
+model = load_yolo_model()
 
 # =============================================
 # STREAMLIT UI
@@ -294,18 +330,22 @@ if menu == "Drone Detection":
                 temp_path = temp_file.name
                 cv2.imwrite(temp_path, image)
 
-            results = model(temp_path)
+            # ✅ Using trained model with confidence threshold
+            results = model(temp_path, conf=CONFIDENCE_THRESHOLD)
             result = results[0]
             annotated = result.plot()
 
-            st.image(annotated, caption="Detection Result")
+            st.image(annotated, caption="Detection Result", channels="BGR")
 
-            drone_type = "drone"
+            drone_type = "unknown"
             confidence = 0.0
 
             if len(result.boxes) > 0:
                 drone_type = model.names[int(result.boxes.cls[0])]
                 confidence = float(result.boxes.conf[0])
+                st.success(f"✅ Detected: **{drone_type}** with **{confidence:.2%}** confidence")
+            else:
+                st.warning(f"⚠️ No drone detected above {CONFIDENCE_THRESHOLD*100:.0f}% confidence threshold.")
 
             output_path = temp_path.replace(".jpg", "_detected.jpg")
             cv2.imwrite(output_path, annotated)
@@ -339,7 +379,6 @@ elif menu == "Delivery Time Predictor":
 
     delivery_model, model_columns = load_delivery_model()
 
-    # ── Dropdown options from training data ──────────────────────────────────
     DRONE_TYPES        = ["Fixed-Wing", "Hybrid VTOL", "Multi-Rotor", "Single-Rotor"]
     CLIMATE_CONDITIONS = ["Clear", "Cloudy", "Windy"]
     SOURCE_AREAS       = ["Adyar", "Guindy", "Nungambakkam", "OMR", "T Nagar", "Tambaram", "Vadapalani"]
@@ -353,12 +392,12 @@ elif menu == "Delivery Time Predictor":
         drone_type = st.selectbox("Drone Type", options=DRONE_TYPES)
         drone_speed = st.selectbox(
             "Drone Speed (km/h)",
-            options=[round(v * 0.5, 1) for v in range(43, 112)],   # 21.5 – 55.5 step 0.5
-            index=33,   # ~38 km/h default
+            options=[round(v * 0.5, 1) for v in range(43, 112)],
+            index=33,
         )
         battery_efficiency = st.selectbox(
             "Battery Efficiency (%)",
-            options=list(range(70, 99)),   # 70 – 98
+            options=list(range(70, 99)),
             index=10,
         )
 
@@ -372,13 +411,13 @@ elif menu == "Delivery Time Predictor":
         st.subheader("📦 Package & Route")
         payload_weight = st.selectbox(
             "Payload Weight (kg)",
-            options=[round(v * 0.1, 1) for v in range(18, 98)],    # 1.8 – 9.7 step 0.1
-            index=12,   # ~3.0 kg default
+            options=[round(v * 0.1, 1) for v in range(18, 98)],
+            index=12,
         )
         distance_km = st.selectbox(
             "Distance (km)",
-            options=[round(v * 0.1, 1) for v in range(10, 50)],    # 1.0 – 4.9 step 0.1
-            index=20,   # ~3.0 km default
+            options=[round(v * 0.1, 1) for v in range(10, 50)],
+            index=20,
         )
         traffic_condition = st.selectbox("Traffic Condition", options=TRAFFIC_CONDITIONS, index=2)
 
@@ -386,17 +425,17 @@ elif menu == "Delivery Time Predictor":
         climate_condition = st.selectbox("Climate Condition", options=CLIMATE_CONDITIONS)
         wind_speed = st.selectbox(
             "Wind Speed (km/h)",
-            options=[round(v * 0.5, 1) for v in range(11, 48)],    # 5.5 – 23.5 step 0.5
+            options=[round(v * 0.5, 1) for v in range(11, 48)],
             index=10,
         )
         temperature = st.selectbox(
             "Temperature (°C)",
-            options=[round(v * 0.1, 1) for v in range(249, 373)],  # 24.9 – 37.2 step 0.1
+            options=[round(v * 0.1, 1) for v in range(249, 373)],
             index=30,
         )
         humidity = st.selectbox(
             "Humidity (%)",
-            options=[round(v * 0.1, 1) for v in range(489, 744)],  # 48.9 – 74.3 step 0.1
+            options=[round(v * 0.1, 1) for v in range(489, 744)],
             index=20,
         )
 
@@ -406,7 +445,6 @@ elif menu == "Delivery Time Predictor":
         try:
             input_data = {col: 0 for col in model_columns}
 
-            # Numeric features — try common column name variants
             numeric_map = {
                 "drone_speed_kmph":     drone_speed,
                 "payload_weight_kg":    payload_weight,
@@ -420,7 +458,6 @@ elif menu == "Delivery Time Predictor":
                 if col in input_data:
                     input_data[col] = val
 
-            # One-hot encoded categoricals
             for prefix, value in [
                 ("drone_type",        drone_type),
                 ("climate_condition", climate_condition),
@@ -514,16 +551,25 @@ elif menu == "AI Chatbot":
                         rows, columns, sql_query = None, None, result[1]
 
                     if rows is None:
-                        response_text = f"Could not fetch data: {sql_query}"
+                        response_text = f"⚠️ Could not fetch data: {sql_query}"
                     elif len(rows) == 0:
-                        response_text = "No records found for your query."
+                        # ✅ FIX: Real empty result from DB — don't hallucinate
+                        response_text = "✅ Query ran successfully but **no records found** in the database for your request."
                     else:
-                        st.caption(f"SQL: `{sql_query}`")
-                        header = " | ".join(columns)
-                        table = f"**{header}**\n\n"
-                        for row in rows:
-                            table += " | ".join(str(v) for v in row) + "\n\n"
-                        response_text = table
+                        # ✅ FIX: Check if Ollama returned NO_DATA signal
+                        if rows[0][0] == "NO_DATA":
+                            response_text = (
+                                "⚠️ I can only answer questions about data stored in your database.\n\n"
+                                "Your database has these fields: **id, drone_type, confidence, image_url, detected_at**\n\n"
+                                "Try asking: *'Show me the last 5 detections'* or *'How many drones were detected today?'*"
+                            )
+                        else:
+                            st.caption(f"🗄️ SQL executed: `{sql_query}`")
+                            header = " | ".join(columns)
+                            table = f"**{header}**\n\n"
+                            for row in rows:
+                                table += " | ".join(str(v) for v in row) + "\n\n"
+                            response_text = table
 
                 elif action == "report":
                     rows, columns, sql_or_err = data_query_agent("get all detections from today")
@@ -577,7 +623,18 @@ elif menu == "AI Chatbot":
                             response_text = f"Report error: {s3_url}"
 
                 else:
-                    response_text = llama_general_response(user_input)
+                    # ✅ FIX: Block hallucination for data-related questions
+                    if any(word in user_input.lower() for word in DATA_KEYWORDS):
+                        response_text = (
+                            "⚠️ I can only answer that using your **real database records**.\n\n"
+                            "I will not guess or make up drone data.\n\n"
+                            "Try rephrasing your question, for example:\n"
+                            "- *'Show me the last 5 detections'*\n"
+                            "- *'How many drones were detected today?'*\n"
+                            "- *'What drone types have been detected?'*"
+                        )
+                    else:
+                        response_text = llama_general_response(user_input)
 
             st.markdown(response_text)
             st.session_state.messages.append({"role": "assistant", "content": response_text})
