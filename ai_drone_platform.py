@@ -17,6 +17,8 @@ from email.mime.application import MIMEApplication
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
+import joblib
+import pandas as pd
 
 # -----------------------------
 # CONFIG
@@ -33,13 +35,27 @@ SMTP_EMAIL = "bptsdg@gmail.com"
 SMTP_PASSWORD = "gbhv jnhu bdyq nmhr"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3"  # change to your installed model e.g. llama2, mistral
+OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
+OLLAMA_MODEL = "llama3:latest"
+
+MODEL_PATH = r"C:\Users\boopa\Desktop\DS\Drone\random_forest_model.pkl"
+COLUMNS_PATH = r"C:\Users\boopa\Desktop\DS\Drone\model_columns.pkl"
 
 # -----------------------------
 # AWS CLIENTS
 # -----------------------------
 
 s3 = boto3.client("s3")
+
+# -----------------------------
+# LOAD DELIVERY MODEL
+# -----------------------------
+
+@st.cache_resource
+def load_delivery_model():
+    model = joblib.load(MODEL_PATH)
+    columns = joblib.load(COLUMNS_PATH)
+    return model, columns
 
 # -----------------------------
 # DB CONNECTION
@@ -58,12 +74,31 @@ def get_db_connection():
 # AGENT 1 — DATA QUERY AGENT
 # =============================================
 
-def data_query_agent(user_query):
-    """
-    Uses Llama to convert natural language into SQL,
-    runs it against RDS, and returns formatted results.
-    """
+def ollama_call(prompt, timeout=60):
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            timeout=timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        if "error" in data:
+            raise ValueError(f"Ollama model error: {data['error']}")
+        if "response" not in data:
+            raise ValueError(f"Unexpected Ollama response: {data}")
+        return data["response"].strip()
+    except requests.exceptions.ConnectionError:
+        raise ConnectionError(
+            "Cannot connect to Ollama. Please open a terminal and run: ollama serve"
+        )
+    except requests.exceptions.Timeout:
+        raise TimeoutError("Ollama timed out. The model may still be loading — try again shortly.")
+    except Exception as e:
+        raise RuntimeError(str(e))
 
+
+def data_query_agent(user_query):
     sql_prompt = f"""
 You are a SQL expert. The database has a table called `detections` with these columns:
 - id (int)
@@ -77,33 +112,17 @@ Do not include any explanation. Return only the SQL query, nothing else.
 
 User question: {user_query}
 """
-
     try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": sql_prompt,
-                "stream": False
-            },
-            timeout=30
-        )
-
-        sql_query = response.json()["response"].strip()
-
-        # Safety check — only allow SELECT
+        sql_query = ollama_call(sql_prompt)
         if not sql_query.upper().startswith("SELECT"):
             return None, "Generated query was not a SELECT statement. Aborting for safety."
-
         connection = get_db_connection()
         cursor = connection.cursor()
         cursor.execute(sql_query)
         rows = cursor.fetchall()
         columns = [desc[0] for desc in cursor.description]
         connection.close()
-
         return rows, columns, sql_query
-
     except Exception as e:
         return None, None, f"Data query error: {e}"
 
@@ -113,17 +132,10 @@ User question: {user_query}
 # =============================================
 
 def report_generation_agent(data, columns, report_title="Drone Detection Report"):
-    """
-    Generates a PDF report from query results,
-    uploads it to S3, and returns the local path + S3 URL.
-    """
-
     try:
         pdf_path = "drone_report.pdf"
         styles = getSampleStyleSheet()
         elements = []
-
-        # Title
         elements.append(Paragraph(report_title, styles["Title"]))
         elements.append(Spacer(1, 0.2 * inch))
         elements.append(
@@ -133,31 +145,22 @@ def report_generation_agent(data, columns, report_title="Drone Detection Report"
             )
         )
         elements.append(Spacer(1, 0.3 * inch))
-
         if not data:
             elements.append(Paragraph("No data found.", styles["Normal"]))
         else:
-            # Column headers
             header = " | ".join(columns)
             elements.append(Paragraph(f"<b>{header}</b>", styles["Normal"]))
             elements.append(Spacer(1, 0.1 * inch))
-
-            # Rows
             for row in data:
                 row_text = " | ".join(str(val) for val in row)
                 elements.append(Paragraph(row_text, styles["Normal"]))
                 elements.append(Spacer(1, 0.05 * inch))
-
         doc = SimpleDocTemplate(pdf_path)
         doc.build(elements)
-
-        # Upload to S3
         s3_key = f"reports/drone_report_{datetime.now().timestamp()}.pdf"
         s3.upload_file(pdf_path, S3_BUCKET, s3_key)
         s3_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
-
         return pdf_path, s3_url
-
     except Exception as e:
         return None, f"Report generation error: {e}"
 
@@ -167,16 +170,11 @@ def report_generation_agent(data, columns, report_title="Drone Detection Report"
 # =============================================
 
 def email_agent(recipient_email, pdf_path, s3_url):
-    """
-    Drafts and sends an email with the PDF report attached.
-    """
-
     try:
         msg = MIMEMultipart()
         msg["From"] = SMTP_EMAIL
         msg["To"] = recipient_email
         msg["Subject"] = "Drone Detection Report"
-
         body = f"""Hello,
 
 Please find attached the latest Drone Detection Report.
@@ -189,42 +187,26 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Regards,
 AI Drone Surveillance Platform
 """
-
         msg.attach(MIMEText(body, "plain"))
-
         with open(pdf_path, "rb") as f:
             attach = MIMEApplication(f.read())
-
-        attach.add_header(
-            "Content-Disposition",
-            "attachment",
-            filename="drone_report.pdf"
-        )
+        attach.add_header("Content-Disposition", "attachment", filename="drone_report.pdf")
         msg.attach(attach)
-
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
         server.login(SMTP_EMAIL, SMTP_PASSWORD)
         server.send_message(msg)
         server.quit()
-
         return True, f"Email successfully sent to {recipient_email}"
-
     except Exception as e:
         return False, f"Email error: {e}"
 
 
 # =============================================
-# LLAMA ROUTER — decides which agent to call
+# LLAMA ROUTER
 # =============================================
 
 def llama_router(user_query):
-    """
-    Sends the user query to Llama and asks it to classify
-    the intent and extract any parameters like email address.
-    Returns a structured JSON decision.
-    """
-
     router_prompt = f"""
 You are an AI assistant for a drone surveillance system.
 Based on the user's message, decide which action to take.
@@ -245,34 +227,19 @@ Respond ONLY in valid JSON format like this:
 
 Rules:
 - Set "email" to the email address found in the message, or null if none
-- Set "report_title" to a suitable title if the user mentions a specific scope (e.g. "today's report"), or null for default
+- Set "report_title" to a suitable title if the user mentions a specific scope, or null for default
 - Do not include any explanation outside the JSON
 
 User message: {user_query}
 """
-
     try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": router_prompt,
-                "stream": False
-            },
-            timeout=30
-        )
-
-        raw = response.json()["response"].strip()
-
-        # Extract JSON safely
+        raw = ollama_call(router_prompt)
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if json_match:
             decision = json.loads(json_match.group())
         else:
             decision = {"action": "general", "email": None, "report_title": None}
-
         return decision
-
     except Exception as e:
         return {"action": "general", "email": None, "report_title": None, "error": str(e)}
 
@@ -282,25 +249,12 @@ User message: {user_query}
 # =============================================
 
 def llama_general_response(user_query):
-    """
-    Falls back to a general Llama response for
-    conversation or questions outside agent scope.
-    """
-
     try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": f"You are an AI assistant for a drone surveillance platform. Answer helpfully.\n\nUser: {user_query}",
-                "stream": False
-            },
-            timeout=30
+        return ollama_call(
+            f"You are an AI assistant for a drone surveillance platform. Answer helpfully.\n\nUser: {user_query}"
         )
-        return response.json()["response"].strip()
-
     except Exception as e:
-        return f"Llama error: {e}"
+        return f"⚠️ {e}"
 
 
 # =============================================
@@ -313,11 +267,12 @@ model = YOLO("yolov8n.pt")
 # STREAMLIT UI
 # =============================================
 
+st.set_page_config(page_title="AI Drone Surveillance Platform", layout="wide")
 st.title("AI Drone Surveillance Platform")
 
 menu = st.sidebar.selectbox(
     "Navigation",
-    ["Drone Detection", "AI Chatbot"]
+    ["Drone Detection", "Delivery Time Predictor", "AI Chatbot"]
 )
 
 # =============================
@@ -327,20 +282,12 @@ menu = st.sidebar.selectbox(
 if menu == "Drone Detection":
 
     st.header("Drone Detection")
-
     uploaded_file = st.file_uploader("Upload Drone Image", type=["jpg", "jpeg", "png"])
 
     if uploaded_file:
-
         if st.button("Detect Drone"):
-
             file_bytes = uploaded_file.read()
-
-            np_arr = cv2.imdecode(
-                np.frombuffer(file_bytes, np.uint8),
-                cv2.IMREAD_COLOR
-            )
-
+            np_arr = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
             image = cv2.resize(np_arr, (640, 640))
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
@@ -371,8 +318,7 @@ if menu == "Drone Detection":
             cursor = connection.cursor()
             cursor.execute(
                 """
-                INSERT INTO detections
-                (drone_type, confidence, image_url, detected_at)
+                INSERT INTO detections (drone_type, confidence, image_url, detected_at)
                 VALUES (%s, %s, %s, NOW())
                 """,
                 (drone_type, confidence, image_url)
@@ -383,52 +329,185 @@ if menu == "Drone Detection":
             st.success("Detection stored successfully!")
 
 # =============================
+# DELIVERY TIME PREDICTOR PAGE
+# =============================
+
+elif menu == "Delivery Time Predictor":
+
+    st.header("🚁 Drone Delivery Time Predictor")
+    st.markdown("Fill in the delivery details below to estimate how long the delivery will take.")
+
+    delivery_model, model_columns = load_delivery_model()
+
+    # ── Dropdown options from training data ──────────────────────────────────
+    DRONE_TYPES        = ["Fixed-Wing", "Hybrid VTOL", "Multi-Rotor", "Single-Rotor"]
+    CLIMATE_CONDITIONS = ["Clear", "Cloudy", "Windy"]
+    SOURCE_AREAS       = ["Adyar", "Guindy", "Nungambakkam", "OMR", "T Nagar", "Tambaram", "Vadapalani"]
+    DESTINATION_AREAS  = ["Anna Nagar", "Guindy", "Mylapore", "Nungambakkam", "T Nagar", "Vadapalani", "Velachery"]
+    TRAFFIC_CONDITIONS = ["High", "Low", "Medium"]
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("🚁 Drone Details")
+        drone_type = st.selectbox("Drone Type", options=DRONE_TYPES)
+        drone_speed = st.selectbox(
+            "Drone Speed (km/h)",
+            options=[round(v * 0.5, 1) for v in range(43, 112)],   # 21.5 – 55.5 step 0.5
+            index=33,   # ~38 km/h default
+        )
+        battery_efficiency = st.selectbox(
+            "Battery Efficiency (%)",
+            options=list(range(70, 99)),   # 70 – 98
+            index=10,
+        )
+
+        st.subheader("📍 Location Details")
+        source_area = st.selectbox("Source Area", options=SOURCE_AREAS)
+        destination_area = st.selectbox("Destination Area", options=DESTINATION_AREAS)
+        if source_area == destination_area:
+            st.warning("⚠️ Source and destination are the same.")
+
+    with col2:
+        st.subheader("📦 Package & Route")
+        payload_weight = st.selectbox(
+            "Payload Weight (kg)",
+            options=[round(v * 0.1, 1) for v in range(18, 98)],    # 1.8 – 9.7 step 0.1
+            index=12,   # ~3.0 kg default
+        )
+        distance_km = st.selectbox(
+            "Distance (km)",
+            options=[round(v * 0.1, 1) for v in range(10, 50)],    # 1.0 – 4.9 step 0.1
+            index=20,   # ~3.0 km default
+        )
+        traffic_condition = st.selectbox("Traffic Condition", options=TRAFFIC_CONDITIONS, index=2)
+
+        st.subheader("🌤️ Weather Conditions")
+        climate_condition = st.selectbox("Climate Condition", options=CLIMATE_CONDITIONS)
+        wind_speed = st.selectbox(
+            "Wind Speed (km/h)",
+            options=[round(v * 0.5, 1) for v in range(11, 48)],    # 5.5 – 23.5 step 0.5
+            index=10,
+        )
+        temperature = st.selectbox(
+            "Temperature (°C)",
+            options=[round(v * 0.1, 1) for v in range(249, 373)],  # 24.9 – 37.2 step 0.1
+            index=30,
+        )
+        humidity = st.selectbox(
+            "Humidity (%)",
+            options=[round(v * 0.1, 1) for v in range(489, 744)],  # 48.9 – 74.3 step 0.1
+            index=20,
+        )
+
+    st.markdown("---")
+
+    if st.button("⏱️ Predict Delivery Time", use_container_width=True):
+        try:
+            input_data = {col: 0 for col in model_columns}
+
+            # Numeric features — try common column name variants
+            numeric_map = {
+                "drone_speed_kmph":     drone_speed,
+                "payload_weight_kg":    payload_weight,
+                "distance_km":          distance_km,
+                "battery_efficiency":   battery_efficiency,
+                "wind_speed_kmph":      wind_speed,
+                "temperature_c":        temperature,
+                "humidity_percent":     humidity,
+            }
+            for col, val in numeric_map.items():
+                if col in input_data:
+                    input_data[col] = val
+
+            # One-hot encoded categoricals
+            for prefix, value in [
+                ("drone_type",        drone_type),
+                ("climate_condition", climate_condition),
+                ("source_area",       source_area),
+                ("destination_area",  destination_area),
+                ("traffic_condition", traffic_condition),
+            ]:
+                col_name = f"{prefix}_{value}"
+                if col_name in input_data:
+                    input_data[col_name] = 1
+
+            input_df = pd.DataFrame([input_data])
+            predicted_time = delivery_model.predict(input_df)[0]
+
+            st.success("✅ Prediction Complete!")
+
+            r1, r2, r3, r4 = st.columns(4)
+            with r1:
+                st.metric("📍 From", source_area)
+            with r2:
+                st.metric("📍 To", destination_area)
+            with r3:
+                st.metric("📏 Distance", f"{distance_km} km")
+            with r4:
+                st.metric("⏱️ Estimated Time", f"{predicted_time:.1f} min")
+
+            st.info(
+                f"**Summary:** A **{drone_type}** drone carrying **{payload_weight} kg** "
+                f"over **{distance_km} km** from **{source_area}** to **{destination_area}** "
+                f"under **{climate_condition}** skies with **{traffic_condition}** traffic "
+                f"is estimated to arrive in **{predicted_time:.1f} minutes**."
+            )
+
+        except Exception as e:
+            st.error(f"Prediction failed: {e}")
+            st.warning(
+                "Tip: Make sure `random_forest_model.pkl` and `model_columns.pkl` "
+                "are in `C:\\Users\\boopa\\Desktop\\DS\\Drone\\` and were trained "
+                "with the same feature names as the training data."
+            )
+
+# =============================
 # AI CHATBOT PAGE
 # =============================
 
-if menu == "AI Chatbot":
+elif menu == "AI Chatbot":
 
     st.header("Drone Intelligence Chatbot")
 
-    # Chat history
+    # --- Ollama status check ---
+    try:
+        ping = requests.get(OLLAMA_TAGS_URL, timeout=3)
+        detected_model = OLLAMA_MODEL
+        st.success(f"✅ Ollama connected — using model: `{detected_model}`")
+    except Exception:
+        st.error(
+            "❌ Ollama is not running. Open a terminal and run: `ollama serve`  \n"
+            "Then refresh this page."
+        )
+        st.stop()
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display chat history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Chat input
     user_input = st.chat_input("Ask me anything about drone detections...")
 
     if user_input:
 
-        # Show user message
         st.session_state.messages.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
             st.markdown(user_input)
 
         with st.chat_message("assistant"):
-
             with st.spinner("Thinking..."):
 
-                # Step 1 — Route the query via Llama
                 decision = llama_router(user_input)
                 action = decision.get("action", "general")
                 email_address = decision.get("email", None)
                 report_title = decision.get("report_title") or "Drone Detection Report"
-
                 response_text = ""
 
-                # ---------------------------------
-                # ACTION: DATA QUERY
-                # ---------------------------------
-
                 if action == "data_query":
-
                     result = data_query_agent(user_input)
-
                     if len(result) == 3:
                         rows, columns, sql_query = result
                     else:
@@ -436,10 +515,8 @@ if menu == "AI Chatbot":
 
                     if rows is None:
                         response_text = f"Could not fetch data: {sql_query}"
-
                     elif len(rows) == 0:
                         response_text = "No records found for your query."
-
                     else:
                         st.caption(f"SQL: `{sql_query}`")
                         header = " | ".join(columns)
@@ -448,93 +525,49 @@ if menu == "AI Chatbot":
                             table += " | ".join(str(v) for v in row) + "\n\n"
                         response_text = table
 
-                # ---------------------------------
-                # ACTION: REPORT ONLY
-                # ---------------------------------
-
                 elif action == "report":
-
-                    rows, columns, sql_or_err = data_query_agent(
-                        "get all detections from today"
-                    )
-
+                    rows, columns, sql_or_err = data_query_agent("get all detections from today")
                     if rows is None:
                         response_text = f"Could not fetch data: {sql_or_err}"
-
                     else:
                         pdf_path, s3_url = report_generation_agent(rows, columns, report_title)
-
                         if pdf_path:
                             response_text = f"Report generated and uploaded to S3.\n\n**S3 URL:** {s3_url}"
                             with open(pdf_path, "rb") as f:
-                                st.download_button(
-                                    "Download Report",
-                                    data=f,
-                                    file_name="drone_report.pdf",
-                                    mime="application/pdf"
-                                )
+                                st.download_button("Download Report", data=f, file_name="drone_report.pdf", mime="application/pdf")
                         else:
                             response_text = f"Report error: {s3_url}"
 
-                # ---------------------------------
-                # ACTION: EMAIL ONLY
-                # ---------------------------------
-
                 elif action == "email":
-
                     if not email_address:
                         email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', user_input)
                         email_address = email_match.group() if email_match else None
-
                     if not email_address:
                         response_text = "Please provide a valid email address in your message."
-
                     else:
-                        rows, columns, sql_or_err = data_query_agent(
-                            "get all detections from today"
-                        )
-
+                        rows, columns, sql_or_err = data_query_agent("get all detections from today")
                         if rows is None:
                             response_text = f"Could not fetch data: {sql_or_err}"
-
                         else:
                             pdf_path, s3_url = report_generation_agent(rows, columns, report_title)
-
                             if pdf_path:
                                 success, msg = email_agent(email_address, pdf_path, s3_url)
                                 response_text = msg
                             else:
                                 response_text = f"Report error: {s3_url}"
 
-                # ---------------------------------
-                # ACTION: REPORT + EMAIL TOGETHER
-                # ---------------------------------
-
                 elif action == "report_email":
-
                     if not email_address:
                         email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', user_input)
                         email_address = email_match.group() if email_match else None
-
-                    rows, columns, sql_or_err = data_query_agent(
-                        "get all detections from today"
-                    )
-
+                    rows, columns, sql_or_err = data_query_agent("get all detections from today")
                     if rows is None:
                         response_text = f"Could not fetch data: {sql_or_err}"
-
                     else:
                         pdf_path, s3_url = report_generation_agent(rows, columns, report_title)
-
                         if pdf_path:
                             with open(pdf_path, "rb") as f:
-                                st.download_button(
-                                    "Download Report",
-                                    data=f,
-                                    file_name="drone_report.pdf",
-                                    mime="application/pdf"
-                                )
-
+                                st.download_button("Download Report", data=f, file_name="drone_report.pdf", mime="application/pdf")
                             if email_address:
                                 success, msg = email_agent(email_address, pdf_path, s3_url)
                                 response_text = f"Report generated.\n\n{msg}\n\n**S3 URL:** {s3_url}"
@@ -542,10 +575,6 @@ if menu == "AI Chatbot":
                                 response_text = f"Report generated and uploaded.\n\n**S3 URL:** {s3_url}\n\nNo email address found in your message."
                         else:
                             response_text = f"Report error: {s3_url}"
-
-                # ---------------------------------
-                # ACTION: GENERAL CONVERSATION
-                # ---------------------------------
 
                 else:
                     response_text = llama_general_response(user_input)
