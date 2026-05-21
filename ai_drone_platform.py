@@ -41,13 +41,9 @@ OLLAMA_MODEL = "llama3:latest"
 MODEL_PATH = r"C:\Users\boopa\Desktop\DS\Drone\random_forest_model.pkl"
 COLUMNS_PATH = r"C:\Users\boopa\Desktop\DS\Drone\model_columns.pkl"
 
-# ✅ Your trained YOLO model path
 YOLO_MODEL_PATH = "runs/detect/train/weights/best.pt"
-
-# ✅ Confidence threshold to avoid false detections
 CONFIDENCE_THRESHOLD = 0.5
 
-# ✅ Keywords that indicate user is asking about detection data
 DATA_KEYWORDS = [
     "detect", "drone", "last", "recent", "found", "confidence",
     "when", "how many", "show", "list", "latest", "history",
@@ -112,7 +108,6 @@ def ollama_call(prompt, timeout=60):
 
 
 def data_query_agent(user_query):
-    # ✅ FIX: Strict SQL prompt — prevents hallucination, forces real DB query only
     sql_prompt = f"""
 You are a SQL expert connected to a real MySQL database.
 The database has a table called `detections` with these exact columns:
@@ -134,8 +129,6 @@ User question: {user_query}
 """
     try:
         sql_query = ollama_call(sql_prompt)
-
-        # Strip any accidental markdown backticks
         sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
 
         if not sql_query.upper().startswith("SELECT"):
@@ -150,6 +143,51 @@ User question: {user_query}
         return rows, columns, sql_query
     except Exception as e:
         return None, None, f"Data query error: {e}"
+
+
+# =============================================
+# ✅ FIX: SMART REPORT DATA FETCHER
+# Tries today first → falls back to last 50 records
+# This fixes the "No data found" issue in emailed reports
+# =============================================
+
+def get_report_data():
+    """
+    Fetch data for reports.
+    1. Try today's detections first.
+    2. If none found, fallback to last 50 records from any date.
+    This prevents empty PDF reports when no detections happened today.
+    """
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        # Step 1: Try today's data
+        cursor.execute(
+            "SELECT * FROM detections WHERE DATE(detected_at) = CURDATE() ORDER BY detected_at DESC"
+        )
+        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+
+        if rows and len(rows) > 0:
+            connection.close()
+            return rows, columns, "Today's detections fetched successfully."
+
+        # Step 2: Fallback — last 50 records regardless of date
+        cursor.execute(
+            "SELECT * FROM detections ORDER BY detected_at DESC LIMIT 50"
+        )
+        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        connection.close()
+
+        if rows and len(rows) > 0:
+            return rows, columns, "No detections today — showing last 50 records."
+
+        return [], columns, "No detections found in the database at all."
+
+    except Exception as e:
+        return None, None, f"Database error while fetching report data: {e}"
 
 
 # =============================================
@@ -284,7 +322,7 @@ def llama_general_response(user_query):
 
 
 # =============================================
-# ✅ LOAD YOUR TRAINED YOLO MODEL
+# LOAD YOLO MODEL
 # =============================================
 
 @st.cache_resource
@@ -330,7 +368,6 @@ if menu == "Drone Detection":
                 temp_path = temp_file.name
                 cv2.imwrite(temp_path, image)
 
-            # ✅ Using trained model with confidence threshold
             results = model(temp_path, conf=CONFIDENCE_THRESHOLD)
             result = results[0]
             annotated = result.plot()
@@ -553,10 +590,8 @@ elif menu == "AI Chatbot":
                     if rows is None:
                         response_text = f"⚠️ Could not fetch data: {sql_query}"
                     elif len(rows) == 0:
-                        # ✅ FIX: Real empty result from DB — don't hallucinate
                         response_text = "✅ Query ran successfully but **no records found** in the database for your request."
                     else:
-                        # ✅ FIX: Check if Ollama returned NO_DATA signal
                         if rows[0][0] == "NO_DATA":
                             response_text = (
                                 "⚠️ I can only answer questions about data stored in your database.\n\n"
@@ -572,10 +607,12 @@ elif menu == "AI Chatbot":
                             response_text = table
 
                 elif action == "report":
-                    rows, columns, sql_or_err = data_query_agent("get all detections from today")
+                    # ✅ FIXED: Use get_report_data() instead of hardcoded "today" query
+                    rows, columns, fetch_msg = get_report_data()
                     if rows is None:
-                        response_text = f"Could not fetch data: {sql_or_err}"
+                        response_text = f"Could not fetch data: {fetch_msg}"
                     else:
+                        st.caption(f"ℹ️ {fetch_msg}")
                         pdf_path, s3_url = report_generation_agent(rows, columns, report_title)
                         if pdf_path:
                             response_text = f"Report generated and uploaded to S3.\n\n**S3 URL:** {s3_url}"
@@ -591,10 +628,12 @@ elif menu == "AI Chatbot":
                     if not email_address:
                         response_text = "Please provide a valid email address in your message."
                     else:
-                        rows, columns, sql_or_err = data_query_agent("get all detections from today")
+                        # ✅ FIXED: Use get_report_data() instead of hardcoded "today" query
+                        rows, columns, fetch_msg = get_report_data()
                         if rows is None:
-                            response_text = f"Could not fetch data: {sql_or_err}"
+                            response_text = f"Could not fetch data: {fetch_msg}"
                         else:
+                            st.caption(f"ℹ️ {fetch_msg}")
                             pdf_path, s3_url = report_generation_agent(rows, columns, report_title)
                             if pdf_path:
                                 success, msg = email_agent(email_address, pdf_path, s3_url)
@@ -606,10 +645,12 @@ elif menu == "AI Chatbot":
                     if not email_address:
                         email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', user_input)
                         email_address = email_match.group() if email_match else None
-                    rows, columns, sql_or_err = data_query_agent("get all detections from today")
+                    # ✅ FIXED: Use get_report_data() instead of hardcoded "today" query
+                    rows, columns, fetch_msg = get_report_data()
                     if rows is None:
-                        response_text = f"Could not fetch data: {sql_or_err}"
+                        response_text = f"Could not fetch data: {fetch_msg}"
                     else:
+                        st.caption(f"ℹ️ {fetch_msg}")
                         pdf_path, s3_url = report_generation_agent(rows, columns, report_title)
                         if pdf_path:
                             with open(pdf_path, "rb") as f:
@@ -623,7 +664,6 @@ elif menu == "AI Chatbot":
                             response_text = f"Report error: {s3_url}"
 
                 else:
-                    # ✅ FIX: Block hallucination for data-related questions
                     if any(word in user_input.lower() for word in DATA_KEYWORDS):
                         response_text = (
                             "⚠️ I can only answer that using your **real database records**.\n\n"
